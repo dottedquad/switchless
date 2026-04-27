@@ -51,6 +51,8 @@
 #define RESET_DEBOUNCE      50
 #define RESET_SHORT         500
 #define RESET_CYCLE         1000
+#define COMBO_HELD          1500
+#define COMBO_SAMPLE_US     50
 
 /* Reset port(s) and pins */
 #define RESET_IN_PORT       PORTA
@@ -243,6 +245,20 @@ unsigned char mode_mask[MODE_PORTS];
 unsigned char current_mode = 0;
 unsigned char displayed_mode = 0;
 
+#if defined CONSOLE_MEGA_DRIVE
+/* Mega Drive controller port 1 wiring:
+ * - Controller pin 6 (button data) -> RA4
+ * - Controller pin 9 (button data) -> RA5
+ * - Controller pin 7 (TH from console) -> RC1 (PIC pin 9)
+ */
+#define MD_DATA_PORT        PORTA
+#define MD_DATA_A           (1 << 4)
+#define MD_DATA_B           (1 << 5)
+#define MD_TH_PORT          PORTC
+#define MD_TH               (1 << 1)
+#define MD_DATA_MASK        (MD_DATA_A | MD_DATA_B)
+#endif
+
 /*
  * Save current state to EEPROM.
  */
@@ -324,6 +340,11 @@ void set_mode(unsigned char m) {
 }
 
 void reset_console(void) {
+    int i = 0;
+
+    /* Start reset feedback immediately: first LED-off overlaps reset hold. */
+    set_led_colour(LED_OFF);
+
     /* Assert the reset signal. */
     if( RESET_IN_PORT & RESET_ACTIVE_HIGH ) {
         RESET_OUT_PORT |= RESET_OUT;
@@ -343,20 +364,69 @@ void reset_console(void) {
     else {
         RESET_OUT_PORT |= RESET_OUT;
     }
+
+    /* Complete remaining reset feedback timing (total 1.5s: off/on x3). */
+    set_led_mode(displayed_mode);
+    __delay_ms(250);
+    for( i = 0 ; i < 2 ; i++ ) {
+        set_led_colour(LED_OFF);
+        __delay_ms(250);
+        set_led_mode(displayed_mode);
+        __delay_ms(250);
+    }
 }
 
 int reset_pressed(void) {
-    if( RESET_IN_PORT & RESET_ACTIVE_HIGH ) {
+    if( (RESET_IN_PORT & RESET_ACTIVE_HIGH) ) {
         return (RESET_IN_PORT & RESET_IN) ? 1 : 0;
     }
     return (RESET_IN_PORT & RESET_IN) ? 0 : 1;
 }
 
+#if defined CONSOLE_MEGA_DRIVE
+/* Returns 1 if controller lines indicate both currently selected buttons low. */
+int combo_sample_active(void) {
+    if( (MD_DATA_PORT & MD_DATA_MASK) == 0 ) {
+        return 1;
+    }
+    return 0;
+}
+
+/* While Start+A+B+C are held, this tracks both TH states and their button pairs. */
+int combo_pressed(void) {
+    unsigned long waiting_us = 0;
+    unsigned char seen_th_high = 0;
+    unsigned char seen_th_low = 0;
+
+    while( combo_sample_active() ) {
+        if( MD_TH_PORT & MD_TH ) {
+            seen_th_high = 1;
+        }
+        else {
+            seen_th_low = 1;
+        }
+
+        if( seen_th_high && seen_th_low && waiting_us >= ((unsigned long)COMBO_HELD * 1000UL) ) {
+            return 1;
+        }
+
+        __delay_us(COMBO_SAMPLE_US);
+        waiting_us += COMBO_SAMPLE_US;
+    }
+
+    return 0;
+}
+#endif
+
 void init_chip(void) {
     int p = 0;
     int m = 0;
 
+    #if defined CONSOLE_MEGA_DRIVE
     CMCON = 0x07; /* Disable comparator */
+    TRISA |= (1 << 4) | (1 << 5); /* RA4 and RA5 set as inputs */
+    TRISC |= (1 << 1);            /* RC1 (TH) set as input */
+    #endif
 
     /* Calculate the bitmasks for the pins used for mode output, based on
      * configuration. This could be done at compile time but this way is easy
@@ -442,7 +512,7 @@ void main(void) {
                 else {
                     /* Whilst button is held, cycle through modes. */
                     while( reset_pressed() ) {
-                        while( reset_pressed() && waiting < RESET_CYCLE ) {
+                        while( ( reset_pressed() ) && waiting < RESET_CYCLE ) {
                             __delay_ms(100);
                             waiting += 100;
                         }
@@ -465,7 +535,17 @@ void main(void) {
                     __delay_ms(RESET_SHORT);
                 }
             }
+            waiting = 0;
+        } // end of reset_pressed() check
+        waiting = 0;
+        
+        #if defined CONSOLE_MEGA_DRIVE
+        /* If combo is held for COMBO_HELD and both TH states were observed, reset console. */
+        if( combo_pressed() ) {
+            reset_console();
         }
-    }
-}
+        #endif
 
+        
+    } // end of while(1) loop
+}
